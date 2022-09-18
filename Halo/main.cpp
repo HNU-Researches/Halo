@@ -5,53 +5,37 @@
 #include <iostream>
 #include <string>
 #include <thread>
-
+// #include "/home/nft/CodeZip/Halo-main/third/pmdk/src/include/libpmem.h"
 #include "Halo.hpp"
+
+
+
 #define NONVAR 1
 using namespace std;
-using namespace HALO;
+// using namespace HALO;
 int n = 30;
 int main(int argc, char *argv[]) {
-#ifdef NONVAR
+
+  cout<<"-------------------------\n";
   Halo<size_t, size_t> halo(1024);
-#elif VARVALUE
-  Halo<size_t, std::string> halo(1024);
-#else
-  Halo<std::string, std::string> halo(1024);
-#endif
+  cout<<"-------------------------\n";
 
   int *r = new int[n];
-#ifdef NONVAR
+
   Pair_t<size_t, size_t> *rp = new Pair_t<size_t, size_t>[n];
   Pair_t<size_t, size_t> *rp2 = new Pair_t<size_t, size_t>[n];
-#elif VARVALUE
-  Pair_t<size_t, std::string> *rp = new Pair_t<size_t, std::string>[n];
-#else
-  Pair_t<std::string, std::string> *rp =
-      new Pair_t<std::string, std::string>[n];
-#endif
+
   for (size_t i = 0; i < n; i++) {
-#ifdef NONVAR
+
     Pair_t<size_t, size_t> p(i, i);
-#elif VARVALUE
-    Pair_t<size_t, std::string> p(i, reinterpret_cast<char *>(&i), 8);
-#else
-    Pair_t<std::string, std::string> p(reinterpret_cast<char *>(&i), 8,
-                                       reinterpret_cast<char *>(&i), 8);
-#endif
-    halo.Insert(p, &r[i]);
+    if(! (halo.Insert(p, &r[i]))) printf("Insert Failed!\n");
   }
+
   halo.wait_all();
   cout << "inserted." << endl;
-  halo.load_factor();
+  // halo.load_factor();
   for (size_t i = 0; i < n; i++) {
-#ifdef NONVAR
     rp[i].set_key(i);
-#elif VARVALUE
-    rp[i].set_key(i);
-#else
-    rp[i].set_key(reinterpret_cast<char *>(&i), 8);
-#endif
 
     halo.Get(&rp[i]);
   }
@@ -61,24 +45,14 @@ int main(int argc, char *argv[]) {
          << endl;
   }
   for (size_t i = 0; i < n; i++) {
-#ifdef NONVAR
+
     Pair_t<size_t, size_t> p(i, rp[i].value() + 1);
-#elif VARVALUE
-    Pair_t<size_t, std::string> p(i, reinterpret_cast<char *>(&i), 8);
-#else
-    Pair_t<std::string, std::string> p(reinterpret_cast<char *>(&i), 8,
-                                       reinterpret_cast<char *>(&i), 8);
-#endif
+
     halo.Update(p, &r[i]);
   }
   for (size_t i = 0; i < n; i++) {
-#ifdef NONVAR
     rp2[i].set_key(i);
-#elif VARVALUE
-    rp2[i].set_key(i);
-#else
-    rp2[i].set_key(reinterpret_cast<char *>(&i), 8);
-#endif
+
     halo.Get(&rp2[i]);
   }
   halo.get_all();

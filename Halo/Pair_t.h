@@ -1,7 +1,7 @@
 #pragma once
 #include <iostream>
 #include <string>
-namespace HALO {
+// namespace HALO {
 #define ROUND_UP(s, n) (((s) + (n)-1) & (~(n - 1)))
 enum OP_t { TRASH, INSERT, DELETED, UPDATE };
 const size_t INVALID = UINT64_MAX;
@@ -44,7 +44,7 @@ class Pair_t {
     auto p = reinterpret_cast<void *>(this);
     auto len = size();
     memcpy(addr, p, len);
-    pmem_persist(addr, len);
+    //pmem_persist(addr, len);
   }
   void store_persist_update(char *addr) { store_persist(addr); }
   void store(void *addr) {
@@ -61,7 +61,7 @@ class Pair_t {
   OP_t get_op() { return static_cast<OP_t>(op); }
   void set_op_persist(OP_t o) {
     op = static_cast<uint16_t>(o);
-    pmem_persist(reinterpret_cast<char *>(this), 8);
+    //pmem_persist(reinterpret_cast<char *>(this), 8);
   }
   // friend std::ostream &operator<<(std::ostream &out, Pair_t A);
   size_t size() {
@@ -116,7 +116,7 @@ class Pair_t<KEY, std::string> {
     auto len = sizeof(KEY) + sizeof(uint32_t) + sizeof(OP_VERSION);
     memcpy(addr, p, len);
     memcpy(addr + len, &svalue[0], _vlen);
-    pmem_persist(addr, len + _vlen);
+    //pmem_persist(addr, len + _vlen);
   }
   void store_persist_update(char *addr) {
     auto p = reinterpret_cast<char *>(this);
@@ -124,7 +124,7 @@ class Pair_t<KEY, std::string> {
     memcpy(addr, p, len);
     memcpy(addr + len, &svalue[0], _vlen);
     reinterpret_cast<Pair_t<KEY, std::string> *>(addr)->set_version(version);
-    pmem_persist(addr, len + _vlen);
+    //pmem_persist(addr, len + _vlen);
   }
   void store(char *addr) {
     auto p = reinterpret_cast<char *>(this);
@@ -138,7 +138,7 @@ class Pair_t<KEY, std::string> {
   OP_t get_op() { return op; }
   void set_op_persist(OP_t o) {
     op = static_cast<uint16_t>(o);
-    pmem_persist(reinterpret_cast<char *>(this), 8);
+    //pmem_persist(reinterpret_cast<char *>(this), 8);
   }
   size_t size() {
     auto total_length =
@@ -205,7 +205,7 @@ class Pair_t<std::string, std::string> {
     memcpy(addr, p, len);
     memcpy(addr + len, &skey[0], _klen);
     memcpy(addr + len + _klen, &svalue[0], _vlen);
-    pmem_persist(addr, len + _klen + _vlen);
+    //pmem_persist(addr, len + _klen + _vlen);
   }
   void store_persist_update(char *addr) {
     auto p = reinterpret_cast<void *>(this);
@@ -215,7 +215,7 @@ class Pair_t<std::string, std::string> {
     memcpy(addr + len + _klen, &svalue[0], _vlen);
     reinterpret_cast<Pair_t<std::string, std::string> *>(addr)->set_version(
         version);
-    pmem_persist(addr, len + _klen + _vlen);
+    //pmem_persist(addr, len + _klen + _vlen);
   }
   void store(char *addr) {
     auto p = reinterpret_cast<void *>(this);
@@ -233,7 +233,7 @@ class Pair_t<std::string, std::string> {
   OP_t get_op() { return static_cast<OP_t>(op); }
   void set_op_persist(OP_t o) {
     op = static_cast<uint16_t>(o);
-    pmem_persist(reinterpret_cast<char *>(this), 8);
+    //pmem_persist(reinterpret_cast<char *>(this), 8);
   }
 
   size_t size() {
@@ -243,4 +243,4 @@ class Pair_t<std::string, std::string> {
   }
 };
 #pragma pack()
-}  // namespace HALO
+// }  // namespace HALO

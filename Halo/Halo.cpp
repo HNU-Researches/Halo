@@ -1,3 +1,4 @@
+
 #include <immintrin.h>
 #include <libpmem.h>
 #include <sched.h>
@@ -8,12 +9,12 @@
 
 #include "Halo.hpp"
 
-namespace HALO {
+// namespace HALO {
 
 #define ROUND_UP(s, n) (((s) + (n)-1) & (~(n - 1)))
 
 MemoryManagerPool memory_manager_Pool;
-string PM_PATH;
+string PM_PATH = "/mnt/pmem";
 mutex PM_MemoryManager::mtx;
 mutex DRAM_MemoryManager::mtx;
 mutex MemoryManagerPool::mtx_pm_pool;
@@ -24,6 +25,8 @@ thread_local char WRITE_BUFFER[MAX_WRITE_BUFFER_SIZE];
 thread_local size_t WRITE_BUFFER_SIZE(0);
 thread_local size_t WRITE_PASS_COUNT(0);
 thread_local void *BUFFER_READ[READ_BUFFER_SIZE];
+thread_local size_t BUFFER_READ_PASS_NUM[READ_BUFFER_SIZE];
+thread_local size_t BUFFER_READ_CURR_CHAIN[READ_BUFFER_SIZE];
 thread_local size_t BUFFER_READ_COUNTER(0);
 
 size_t PM_MemoryManager::PAGE_ID = 0;
@@ -121,7 +124,7 @@ void DRAM_MemoryManager::creat_new_space() {
   lock_guard<mutex> guard(DRAM_MemoryManager::mtx);
   if (base_addr)
     reinterpret_cast<PAGE_METADATA *>(base_addr)->LOCAL_OFFSET = local_offset;
-  base_addr = static_cast<char *>(aligned_alloc(CACHE_LINE_SIZE, PAGE_SIZE));
+  base_addr = static_cast<char *>(aligned_alloc(CACHE_LINE_SIZE_H, PAGE_SIZE));
   current_PAGE_ID = DRAM_MemoryManager::PAGE_ID++;
   DPage_table[current_PAGE_ID] = base_addr;
   pages.push_back(current_PAGE_ID);
@@ -146,7 +149,8 @@ void DRAM_MemoryManager::persist(Segment *ht_new,
     _mm_stream_si64(reinterpret_cast<long long *>(addr + i),
                     *(reinterpret_cast<long long *>(ptr + i)));
   }
-  pmem_drain();
+  //pmem_drain();
+  printf(" pmem_drain();\n");
   pmem_unmap(addr, size);
 
   // persist DPages
@@ -161,7 +165,7 @@ void DRAM_MemoryManager::persist(Segment *ht_new,
         _mm_stream_si64(reinterpret_cast<long long *>(addr + i),
                         *(reinterpret_cast<long long *>(page_addr + i)));
       }
-      pmem_drain();
+      // pmem_drain();
       pmem_unmap(addr, PAGE_SIZE);
     } else
       break;
@@ -174,23 +178,23 @@ void DRAM_MemoryManager::persist(Segment *ht_new,
     // if crash here, we use old snapshot verison.
     ROOT->SS[ID].SEGMENT_SIZE = ht_new->num_buckets;
     ROOT->CURRENT_DPAGE_ID[ID] = current_PAGE_ID;
-    pmem_persist(&ROOT->CURRENT_DPAGE_ID[ID], sizeof(size_t));
+    //pmem_persist(&ROOT->CURRENT_DPAGE_ID[ID], sizeof(size_t));
     {
       lock_guard<mutex> guard(DRAM_MemoryManager::mtx);
       ROOT->DPAGE_ID = DRAM_MemoryManager::PAGE_ID;
     }
-    pmem_persist(&ROOT->DPAGE_ID, sizeof(size_t));
+    //pmem_persist(&ROOT->DPAGE_ID, sizeof(size_t));
 
     // after updateing SNAPSHOT_VERSION, we can use the new snapshot
     ROOT->SS[ID].SNAPSHOT_VERSION = snapshot_version;
-    pmem_persist(&ROOT->SS[ID], sizeof(ROOT->SS[ID]));
+    //pmem_persist(&ROOT->SS[ID], sizeof(ROOT->SS[ID]));
 
     // if crash here, we use new snapshot verison but redo more logs(from last
     // checkpoint).
     for (size_t i = 0; i < CORE_NUM; i++) {
       ROOT->SEGMENT_CHECKPOINT[ID][i] = checkpoints[i];
     }
-    pmem_persist(ROOT->SEGMENT_CHECKPOINT[ID], sizeof(size_t) * CORE_NUM);
+    //pmem_persist(ROOT->SEGMENT_CHECKPOINT[ID], sizeof(size_t) * CORE_NUM);
   }
 
   // free old DPage
@@ -205,6 +209,7 @@ void DRAM_MemoryManager::persist(Segment *ht_new,
   //     this);
   // t.join();
 }
+
 void DRAM_MemoryManager::reclaim(Segment *ht_old) {
   thread t(
       [](Segment *seg, DRAM_MemoryManager *dm) {
@@ -232,7 +237,7 @@ void PM_MemoryManager::update_metadata() {
       reinterpret_cast<long long *>(
           &reinterpret_cast<PAGE_METADATA *>(base_addr)->LOCAL_OFFSET),
       *reinterpret_cast<long long *>(&local_offset));
-  pmem_drain();
+  //pmem_drain();
 }
 void PM_MemoryManager::creat_new_space() {
   lock_guard<mutex> guard(PM_MemoryManager::mtx);
@@ -251,15 +256,15 @@ void PM_MemoryManager::creat_new_space() {
   page_metadata->FREED = 0;
   page_metadata->ALLOCATOR_ID = ID;
   // if crash here, this PPage will be deleted during recovery
-  pmem_persist(base_addr, PRESERVE_SIZE_EACH_PAGE);
+  //pmem_persist(base_addr, PRESERVE_SIZE_EACH_PAGE);
   ROOT->PPAGE_ID = PM_MemoryManager::PAGE_ID;
   // if crash here, we will get the largest PPAGE_ID as counter by scanning all
   // PPages.
-  pmem_persist(&ROOT->PPAGE_ID, sizeof(size_t));
+  //pmem_persist(&ROOT->PPAGE_ID, sizeof(size_t));
   ROOT->CURRENT_PPAGE_ID[ID] = current_PAGE_ID;
   // if crash here, we will get the largest PPAGE_ID as counter by scanning all
   // PPages.
-  pmem_persist(&ROOT->CURRENT_PPAGE_ID[ID], sizeof(size_t));
+  //pmem_persist(&ROOT->CURRENT_PPAGE_ID[ID], sizeof(size_t));
   local_offset = PRESERVE_SIZE_EACH_PAGE;
 }
 
@@ -348,9 +353,9 @@ void MemoryManagerPool::shutdown(CLHT *clhts[TABLE_NUM]) {
   }
   ROOT->DPAGE_ID = DRAM_MemoryManager::PAGE_ID;
   ROOT->PPAGE_ID = PM_MemoryManager::PAGE_ID;
-  pmem_persist(ROOT, sizeof(root));
+  //pmem_persist(ROOT, sizeof(root));
   ROOT->clean = 1;
-  pmem_persist(&ROOT->clean, sizeof(ROOT->clean));
+  //pmem_persist(&ROOT->clean, sizeof(ROOT->clean));
   pmem_unmap(ROOT, METADATA_SIZE);
   for (size_t i = 0; i < TABLE_NUM; i++) {
     auto &dm = clhts[i]->table->hallocD;
@@ -461,7 +466,7 @@ std::vector<size_t> MemoryManagerPool::startup(CLHT *clhts[TABLE_NUM]) {
           }
           clhts[aid]->table->hallocD->pages.push_back(page_id);
           DPage_table[page_id] =
-              static_cast<char *>(aligned_alloc(CACHE_LINE_SIZE, PAGE_SIZE));
+              static_cast<char *>(aligned_alloc(CACHE_LINE_SIZE_H, PAGE_SIZE));
           auto cp = [](void *dst, void *src) {
             memcpy(dst, src, PAGE_SIZE);
             pmem_unmap(dst, PAGE_SIZE);
@@ -538,7 +543,7 @@ std::vector<size_t> MemoryManagerPool::startup(CLHT *clhts[TABLE_NUM]) {
           } else {
             clhts[aid]->table->hallocD->pages.push_back(page_id);
             DPage_table[page_id] =
-                static_cast<char *>(aligned_alloc(CACHE_LINE_SIZE, PAGE_SIZE));
+                static_cast<char *>(aligned_alloc(CACHE_LINE_SIZE_H, PAGE_SIZE));
             auto cp = [](void *dst, void *src) {
               memcpy(dst, src, PAGE_SIZE);
               pmem_unmap(dst, PAGE_SIZE);
@@ -564,4 +569,4 @@ std::vector<size_t> MemoryManagerPool::startup(CLHT *clhts[TABLE_NUM]) {
   }
   return checkpoint;
 }
-}  // namespace HALO
+// }  // namespace HALO

@@ -22,7 +22,7 @@
 #include "Pair_t.h"
 #include "timer.h"
 
-namespace HALO {
+// namespace HALO {
 using namespace std;
 
 #define ALIGNED(N) __attribute__((aligned(N)))
@@ -30,14 +30,18 @@ using namespace std;
 #define Unlikely(x) __builtin_expect((x), 0)
 #define CAS_U64_BOOL(a, b, c) (CAS_U64(a, b, c) == b)
 
-#define GET_CLHT_INDEX(kh, n) ((kh >> 56) % n)
+#define GET_CLHT_INDEX(kh, n) (kh & (n-1))
+// #define GET_CLHT_INDEX(kh, n) (kh % n)
+
+#define GET_CLHT_INDEX_HKEY(kh, n) ((kh >> 56) % n)
 #define ROUND_UP(s, n) (((s) + (n)-1) & (~(n - 1)))
 constexpr size_t MAX_BATCHING_SIZE = 256;
 constexpr size_t READ_BUFFER_SIZE = 16 /* Pairs */;
+// constexpr size_t READ_BUFFER_SIZE = 1 /* Pairs */;
 
 using clht_val_t = volatile size_t;
 using clht_lock_t = volatile uint8_t;
-constexpr int CACHE_LINE_SIZE = 64;
+constexpr int CACHE_LINE_SIZE_H = 64;
 constexpr int ENTRIES_PER_BUCKET = 3;
 enum LOCK_STATE { LOCK_FREE = 0, LOCK_UPDATE = 1, LOCK_RESIZE = 2 };
 constexpr int CLHT_PERC_EXPANSIONS = 1;
@@ -76,6 +80,8 @@ extern thread_local char WRITE_BUFFER[MAX_WRITE_BUFFER_SIZE];
 extern thread_local size_t WRITE_BUFFER_SIZE;
 extern thread_local size_t WRITE_PASS_COUNT;
 extern thread_local void *BUFFER_READ[READ_BUFFER_SIZE];
+extern thread_local size_t BUFFER_READ_PASS_NUM[READ_BUFFER_SIZE];
+extern thread_local size_t BUFFER_READ_CURR_CHAIN[READ_BUFFER_SIZE];
 extern thread_local size_t BUFFER_READ_COUNTER;
 enum INSERT_STATE { EXIST = -1, INSERTING = 0, DONE = 1 };
 extern root *ROOT;
@@ -262,16 +268,20 @@ struct Bucket {
   size_t key[ENTRIES_PER_BUCKET];
   clht_val_t val[ENTRIES_PER_BUCKET];
   volatile size_t next;
-} ALIGNED(CACHE_LINE_SIZE);
+  Bucket *chain_next;
+
+} ALIGNED(CACHE_LINE_SIZE_H);
 
 struct Segment {
   union {
     struct {
+      // size_t *lenght_chain;
+
       size_t num_buckets;
       Bucket *buckets;
       size_t hash;
       size_t snapshot_version;
-      uint8_t next_cache_line[CACHE_LINE_SIZE - (3 * sizeof(size_t)) -
+      uint8_t next_cache_line[CACHE_LINE_SIZE_H - (3 * sizeof(size_t)) -
                               (sizeof(void *))];
       DRAM_MemoryManager *hallocD;
       Segment *table_prev;
@@ -284,15 +294,22 @@ struct Segment {
       volatile int32_t is_helper;
       volatile int32_t helper_done;
       size_t version_min;
+      size_t lenght_chain[4096];
+      int pass_num;
+      // size_t *curr_chain;
+      bool is_PRO;
     };
-    uint8_t padding[2 * CACHE_LINE_SIZE];
+    uint8_t padding[2 * CACHE_LINE_SIZE_H];
+    
+
+
   };
-} ALIGNED(CACHE_LINE_SIZE);
+} ALIGNED(CACHE_LINE_SIZE_H);
 struct CLHT {
   union {
     struct {
       Segment *table;
-      uint8_t next_cache_line[CACHE_LINE_SIZE - (sizeof(void *))];
+      uint8_t next_cache_line[CACHE_LINE_SIZE_H - (sizeof(void *))];
       Segment *table_resizing;
       size_t resize_location;
       int64_t ID;
@@ -300,7 +317,7 @@ struct CLHT {
       volatile clht_lock_t gc_lock;
       volatile clht_lock_t status_lock;
     };
-    uint8_t padding[2 * CACHE_LINE_SIZE];
+    uint8_t padding[2 * CACHE_LINE_SIZE_H];
   };
   uint8_t TRYLOCK_ACQ(volatile uint8_t *addr) {
     uint8_t oldval;
@@ -319,6 +336,8 @@ struct CLHT {
   int LOCK_ACQ(clht_lock_t *lock, Segment *h) {
     char once = 1;
     clht_lock_t l;
+
+
     while ((l = __sync_val_compare_and_swap(lock, LOCK_STATE::LOCK_FREE,
                                             LOCK_STATE::LOCK_UPDATE)) ==
            LOCK_STATE::LOCK_UPDATE) {
@@ -332,8 +351,10 @@ struct CLHT {
       }
       return 0;
     }
+	// printf("lock:%d\n",*lock);
     return 1;
   }
+
   // Swap size_t
   static inline size_t swap_uint64(volatile size_t *target, size_t x) {
     __asm__ __volatile__("xchgq %0,%1"
@@ -386,8 +407,19 @@ struct CLHT {
     gc_lock = LOCK_FREE;
     status_lock = LOCK_FREE;
   }
+
+  CLHT(size_t num_buckets, size_t num_pass, int id, size_t version, bool ini) {
+    ID = id;
+    table = clht_hashtable_create(num_buckets, num_pass, version, ini);
+    resize_location = UINT64_MAX;
+    resize_lock = LOCK_FREE;
+    gc_lock = LOCK_FREE;
+    status_lock = LOCK_FREE;
+  }
+
   /* Insert a key-value entry into a hash table. */
   int clht_put(size_t key, clht_val_t val) {
+    // printf("put key!\n");
     Segment *hashtable = table;
     size_t bin = clht_hash(hashtable, key);
     volatile Bucket *bucket = hashtable->buckets + bin;
@@ -420,6 +452,7 @@ struct CLHT {
       if (Likely(bucket->next == INVALID)) {
         if (Unlikely(empty == NULL)) {
           auto r = clht_bucket_create_stats(hashtable, &resize);
+
           Bucket *b = r.second;
           b->val[0] = val;
           b->key[0] = key;
@@ -432,12 +465,60 @@ struct CLHT {
         LOCK_RLS(lock);
         if (Unlikely(resize)) {
           ht_status(1, 0);
+          // printf("resize!\n");
         }
         return true;
       }
       bucket = (Bucket *)get_DPage_addr(bucket->next);
     } while (true);
   }
+
+  size_t get_chain_lenght(size_t num_pass) {
+    // printf("pass_number:%d \n", num_pass);
+    return table->lenght_chain[num_pass / TABLE_NUM];
+  }
+
+  int clht_put(size_t key, size_t the_key, clht_val_t val) {
+    // printf("put key2!\n");
+
+    Segment *hashtable = table;
+    // size_t bin = clht_hash(hashtable, key);
+    size_t bin = ((the_key) & ((1 << table->pass_num) - 1)) / TABLE_NUM;
+    // size_t bin = ((the_key) % 64) / TABLE_NUM;
+    volatile Bucket *bucket = hashtable->buckets + bin;
+
+
+    clht_lock_t *lock = &bucket->lock;
+
+    while (!LOCK_ACQ(lock, hashtable)) { 
+	    hashtable = table;
+      //   size_t bin = clht_hash(hashtable, key);
+        size_t bin = ((the_key) & ((1 << table->pass_num) - 1)) / TABLE_NUM;
+      // size_t bin = ((the_key) % 64) / TABLE_NUM;
+      bucket = hashtable->buckets + bin;
+      lock = &bucket->lock;
+
+    }
+
+    // printf("the_key:%d table->pass_num:%d  hashtable->lenght_chain[%d]:%d\n", the_key, table->pass_num, bin, hashtable->lenght_chain[bin]);
+    if (hashtable->lenght_chain[bin] < 3) {
+      bucket->val[hashtable->lenght_chain[bin]] = val;
+      bucket->key[hashtable->lenght_chain[bin]] = key;
+      hashtable->lenght_chain[bin] += 1;
+    } else {
+      bucket = bucket->chain_next;
+
+      size_t idx_chain = (hashtable->lenght_chain[bin] - 3) / 3;
+      size_t idx_chain_ENTRIES = hashtable->lenght_chain[bin] % 3;
+      bucket[idx_chain].key[idx_chain_ENTRIES] = key;
+      bucket[idx_chain].val[idx_chain_ENTRIES] = val;
+      hashtable->lenght_chain[bin] += 1;
+    }
+     LOCK_RLS(lock);
+    // printf("-------------------put_end-----------------\n");
+    return true;
+  }
+
   /* Remove a key-value entry from a hash table. */
   template <typename KEY, typename VALUE>
   pair<size_t, size_t> clht_remove(size_t key, Pair_t<KEY, VALUE> *Null) {
@@ -471,7 +552,7 @@ struct CLHT {
           auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(addr);
           sz = __sync_fetch_and_add(freed, p->size());
           sz += p->size();
-          pmem_persist(freed, 8);
+          // pmem_persist(freed, 8);
           p->set_op_persist(OP_t::DELETED);
           LOCK_RLS(lock);
           return {sz, page_id};
@@ -512,6 +593,7 @@ struct CLHT {
   }
   /* Retrieve a key-value entry from a hash table. */
   pair<clht_val_t, uint8_t> clht_get(size_t key) {
+
     size_t bin = clht_hash(table, key);
     if (resize_lock)
       ;
@@ -529,10 +611,61 @@ struct CLHT {
           }
         }
       }
+
       bucket = (Bucket *)get_DPage_addr(bucket->next);
     } while (Unlikely(bucket != NULL));
     return {INVALID, 0};
   }
+
+  pair<clht_val_t, uint8_t> clht_get(size_t hash_indx, size_t curr_chain) {
+
+    size_t bin = hash_indx / TABLE_NUM;
+    if (resize_lock)
+      ;
+    volatile Bucket *bucket = table->buckets + bin;
+
+    if (curr_chain < 3) {
+      clht_val_t val = bucket->val[curr_chain];
+      return {val, 0};
+    } else {
+      bucket = bucket->chain_next;
+      clht_val_t val = bucket[(curr_chain / 3) - 1].val[curr_chain % 3];
+      return {val, 0};
+    }
+  }
+
+  size_t clht_get_key(size_t *table_index, size_t *bucket_number,
+                      size_t *buckets_index) {
+    if (resize_lock)
+      ;
+    volatile Bucket *bucket = table->buckets + *table_index;
+    size_t temp = *bucket_number;
+    while (temp--) {
+      bucket = (Bucket *)get_DPage_addr(bucket->next);
+    }
+    uint32_t j;
+    do {
+      // printf("table_index:%d\n", *table_index);
+      for (; *buckets_index < ENTRIES_PER_BUCKET; *buckets_index += 1) {
+        // printf("buckets_index:%d\n", *buckets_index);
+        auto key = bucket->key[*buckets_index];
+
+        if (key != INVALID) {
+          printf("val:%lld\n", key);
+          *buckets_index += 1;
+
+          return key;
+        }
+      }
+      bucket = (Bucket *)get_DPage_addr(bucket->next);
+      *buckets_index = 0;
+      *bucket_number += 1;
+    } while (bucket != NULL);
+    *table_index += 1;
+    *bucket_number = 0;
+    return false;
+  }
+
   /* Insert a key-value pair into a hashtable with replacement. */
   template <typename KEY, typename VALUE>
   pair<int, size_t> clht_put_replace(size_t key, Pair_t<KEY, VALUE> *p) {
@@ -687,7 +820,7 @@ struct CLHT {
             mmanager.update_metadata();
             _mm_stream_si64(reinterpret_cast<long long *>(reclaimed),
                             *reinterpret_cast<long long *>(&offset_old));
-            pmem_drain();
+            // pmem_drain();
           }
         }
         LOCK_RLS(lock);
@@ -748,6 +881,7 @@ struct CLHT {
   }
   size_t clht_size(Segment *hashtable) {
     size_t num_buckets = hashtable->num_buckets;
+    // printf("num_buckets:%ld\n",num_buckets);
     volatile Bucket *bucket = NULL;
     size_t size = 0;
 
@@ -758,7 +892,9 @@ struct CLHT {
       uint32_t j;
       do {
         for (j = 0; j < ENTRIES_PER_BUCKET; j++) {
-          if (bucket->key[j] > 0) {
+          if (bucket->key[j] != INVALID) {
+            // printf("get size----table number:%d,
+            // key:%ld\n",ID,bucket->key[j]);
             size++;
           }
         }
@@ -869,20 +1005,21 @@ struct CLHT {
   Segment *clht_hashtable_create(size_t num_buckets, size_t version,
                                  bool ini = true) {
     Segment *hashtable = NULL;
-
+    // printf("-----------clht_hashtable_create--------------\n");
+    // printf("ID:%d num_buckets:%ld\n",ID,num_buckets);
     if (num_buckets == 0) {
       return NULL;
     }
 
     /* Allocate the table itself. */
-    hashtable = (Segment *)memalign(CACHE_LINE_SIZE, sizeof(Segment));
+    hashtable = (Segment *)memalign(CACHE_LINE_SIZE_H, sizeof(Segment));
     if (hashtable == NULL) {
       printf("** malloc @ hatshtalbe\n");
       return NULL;
     }
 
     hashtable->buckets =
-        (Bucket *)memalign(CACHE_LINE_SIZE, num_buckets * (sizeof(Bucket)));
+        (Bucket *)memalign(CACHE_LINE_SIZE_H, num_buckets * (sizeof(Bucket)));
     if (hashtable->buckets == NULL) {
       printf("** alloc: hashtable->table\n");
       fflush(stdout);
@@ -900,6 +1037,8 @@ struct CLHT {
           hashtable->buckets[i].key[j] = INVALID;
         }
       }
+    hashtable->is_PRO = false;
+    // printf("hashtable->is_PRO = %d\n", hashtable->is_PRO);
 
     hashtable->num_buckets = num_buckets;
     hashtable->hash = num_buckets - 1;
@@ -915,6 +1054,104 @@ struct CLHT {
     hashtable->is_helper = 1;
     hashtable->helper_done = 0;
 
+    // printf("hashtable->num_buckets:%ld \n",hashtable->num_buckets);
+    //   printf("-----------clht_hashtable_create--------------\n");
+    return hashtable;
+  }
+
+  Segment *clht_hashtable_create(size_t num_buckets, size_t num_pass,
+                                 size_t version, bool ini = true) {
+    Segment *hashtable = NULL;
+    // printf("-----------clht_hashtable_create--------------\n");
+    // printf("ID:%d num_buckets:%ld\n",ID,num_buckets);
+    if (num_buckets == 0) {
+      return NULL;
+    }
+
+    int num_head = (1 << num_pass) / TABLE_NUM;
+    size_t num_chain = (num_buckets + num_head) / num_head;
+
+	  // printf("num_head:%d,num_chain:%d\n",num_head,num_chain);
+
+    /* Allocate the table itself. */
+    hashtable = (Segment *)memalign(CACHE_LINE_SIZE_H, sizeof(Segment));
+    if (hashtable == NULL) {
+      printf("** malloc @ hatshtalbe\n");
+      return NULL;
+    }
+
+    // hashtable->buckets =
+    //     (Bucket *)memalign(CACHE_LINE_SIZE_H, num_buckets *
+    //     (sizeof(Bucket)));
+
+    hashtable->buckets =
+        (Bucket *)memalign(CACHE_LINE_SIZE_H, num_head * (sizeof(Bucket)));
+    // hashtable->lenght_chain = (size_t *)calloc(num_head, sizeof(size_t));
+	  memset(hashtable->lenght_chain,0,sizeof(hashtable->lenght_chain));
+    // hashtable->curr_chain = (size_t *)calloc(num_head, sizeof(size_t));
+    // for(int ii = 0;ii < 256; ii++)
+    //     hashtable->lenght_chain[ii] = 0;
+
+
+    if (hashtable->buckets == NULL) {
+      printf("** alloc: hashtable->table\n");
+      fflush(stdout);
+      free(hashtable);
+      return NULL;
+    }
+
+    // if (ini)
+    //   for (i = 0; i < num_buckets; i++) {
+    //     hashtable->buckets[i].lock = LOCK_FREE;
+    //     hashtable->buckets[i].next = INVALID;
+    //     uint32_t j;
+    //     for (j = 0; j < ENTRIES_PER_BUCKET; j++) {
+    //       hashtable->buckets[i].key[j] = INVALID;
+    //     }
+    //   }
+
+    // volatile Bucket *bucket;
+
+    if (ini) {
+      for (int j = 0; j < num_head; j++) {
+        hashtable->buckets[j].lock = LOCK_FREE;
+        hashtable->buckets[j].next = INVALID;
+
+		    Bucket *bucket_chain =  (Bucket *)memalign(CACHE_LINE_SIZE_H, num_chain * (sizeof(Bucket)));
+        for (int k = 0; k < ENTRIES_PER_BUCKET; k++) {
+          hashtable->buckets[j].key[k] = INVALID;
+        }
+        for (size_t i = 0; i < num_chain; i++) {
+          bucket_chain[i].lock = LOCK_FREE;
+          bucket_chain[i].next = INVALID;
+          for (int k = 0; k < ENTRIES_PER_BUCKET; k++) {
+            bucket_chain[i].key[k] = INVALID;
+          }
+        }
+		hashtable->buckets[j].chain_next = bucket_chain;
+      }
+        
+    }
+    hashtable->pass_num = num_pass;
+    // printf("hashtable->pass_num:%d\n", hashtable->pass_num);
+
+    hashtable->is_PRO = true;
+    hashtable->num_buckets = num_buckets;
+    hashtable->hash = num_buckets - 1;
+    hashtable->snapshot_version = version;
+    hashtable->hallocD = new DRAM_MemoryManager(ID, version);
+    hashtable->table_new = NULL;
+    hashtable->table_prev = NULL;
+    hashtable->num_expands = 0;
+    hashtable->num_expands_threshold = (CLHT_PERC_EXPANSIONS * num_buckets);
+    if (hashtable->num_expands_threshold == 0) {
+      hashtable->num_expands_threshold = 1;
+    }
+    hashtable->is_helper = 1;
+    hashtable->helper_done = 0;
+
+    // printf("hashtable->num_buckets:%ld \n",hashtable->num_buckets);
+    // printf("-----------clht_hashtable_end--------------\n");
     return hashtable;
   }
 
@@ -942,7 +1179,7 @@ struct CLHT {
     return false;
   }
 
-} ALIGNED(CACHE_LINE_SIZE);
+} ALIGNED(CACHE_LINE_SIZE_H);
 
 /**
  * @brief Halo hash table define.
@@ -952,9 +1189,8 @@ template <typename KEY, typename VALUE>
 class Halo {
  public:
   Halo(size_t N) {
-    cout << typeid(KEY).name() << " " << typeid(VALUE).name() << endl;
+    // cout << typeid(KEY).name() << " " << typeid(VALUE).name() << endl;
     memset(clhts, 0, TABLE_NUM * sizeof(void *));
-
     if (SNAPSHOT && filesystem::exists(PM_PATH)) {
       Timer t;
       t.start();
@@ -1008,44 +1244,87 @@ class Halo {
       std::cout << "Recover cost " << t.elapsed<std::chrono::milliseconds>()
                 << " ms." << endl;
       ROOT->clean = false;
-      pmem_persist(&ROOT->clean, sizeof(ROOT->clean));
+      // pmem_persist(&ROOT->clean, sizeof(ROOT->clean));
     } else {
       memory_manager_Pool.creat();
-      cout << "Create new table." << endl;
-      auto sz = N / TABLE_NUM;
-      cout << sz << " ";
-      sz = log2(sz / ENTRIES_PER_BUCKET);
-      cout << sz << " ";
+      // cout << "Create new table." << endl;
+      auto sz = (N + TABLE_NUM) / TABLE_NUM;
+      // sz = log2((sz+ENTRIES_PER_BUCKET)/ ENTRIES_PER_BUCKET);
+      sz = log2((sz + ENTRIES_PER_BUCKET) / ENTRIES_PER_BUCKET);
+      // cout << sz << " ";
       sz = pow(2, sz);
+      // cout<<"size_each_table:" << sz << "\n";
       for (size_t i = 0; i < TABLE_NUM; i++) ROOT->SS[i].SEGMENT_SIZE = sz;
-      pmem_persist(ROOT->SS, sizeof(ROOT->SS) * TABLE_NUM);
-      cout << sz * TABLE_NUM * ENTRIES_PER_BUCKET << endl;
+      // pmem_persist(ROOT->SS, sizeof(ROOT->SS) * TABLE_NUM);
       for (size_t i = 0; i < TABLE_NUM; i++) {
         clhts[i] = new CLHT(sz, i, 0, true);
       }
+      is_pro = false;
     }
     load_factor();
+    //  cout<<"--------------end create HALO-------------- \n";
   }
+
+  Halo(size_t N, size_t num_pass) {
+    memset(clhts, 0, TABLE_NUM * sizeof(void *));
+    cout<<"TOTAL(tuples):" << N << "\n";
+    memory_manager_Pool.creat();
+    cout << "Create new table." << endl;
+    printf("sz of pair in Halo:%ld\n",N);
+    auto sz = (N + TABLE_NUM) / TABLE_NUM;
+    // printf("sz of pair in each CLHT:%ld\n",sz);
+    // sz = log2((sz+ENTRIES_PER_BUCKET)/ ENTRIES_PER_BUCKET);
+    sz = log2((sz + ENTRIES_PER_BUCKET) / ENTRIES_PER_BUCKET);
+    // printf("sz:%ld\n",sz);
+    sz = pow(2, sz);
+    if(sz < (((N + TABLE_NUM) / TABLE_NUM) + ENTRIES_PER_BUCKET) / ENTRIES_PER_BUCKET) sz*=2;
+    cout<<"size_each_table(buckets):" << sz * 32 << "\n";
+
+    // auto sz = (N ) / TABLE_NUM;
+    // sz = (sz + ENTRIES_PER_BUCKET ) / ENTRIES_PER_BUCKET;
+    // cout<<"TOTAL(buckets):" << sz * 32 << "\n";
+    
+    for (size_t i = 0; i < TABLE_NUM; i++) ROOT->SS[i].SEGMENT_SIZE = sz;
+    // pmem_persist(ROOT->SS, sizeof(ROOT->SS) * TABLE_NUM);
+    for (size_t i = 0; i < TABLE_NUM; i++) {
+      clhts[i] = new CLHT(sz, num_pass, i, 0, true);
+    }
+    load_factor();
+    //  cout<<"--------------end create HALO-------------- \n";
+    is_pro = true;
+  }
+
   ~Halo() {
     for (auto &&i : reclaim_threads) i.join();
     memory_manager_Pool.shutdown(clhts);
   }
 
+  bool Is_pro(){
+    return is_pro;
+  }
+
   bool Insert(Pair_t<KEY, VALUE> &p, int *r) {
     if (Unlikely(mmanager.ID == -1))
       memory_manager_Pool.get_PM_MemoryManager(&mmanager);
-    auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
-    auto addr = get_PM_addr(hkey);
-    // check if the key exists
-    if (addr != nullptr) {
-      *r = EXIST;
-      WRITE_PASS_COUNT++;
-      if (WRITE_PASS_COUNT + WRITE_BUFFER_COUNTER > MAX_PAIR) {
-        do_insert_now(nullptr);
-        return true;
-      }
-      return false;
-    } else {
+
+    // auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
+    // printf("is_pro:%d Insert---:hkey:%ld\n",is_pro,hkey);
+    // auto * addr = get_PM_addr(hkey);
+    // if(is_pro){ size_t the_key = *reinterpret_cast<size_t *>(p.key());  addr = get_PM_addr(hkey,the_key);}
+
+    // printf("is_pro:%d Insert---:hkey:%ld\n",is_pro,hkey);
+    // // check if the key exists
+    // if (addr != nullptr) {
+    //   *r = EXIST;
+    //   WRITE_PASS_COUNT++;
+    //   if (WRITE_PASS_COUNT + WRITE_BUFFER_COUNTER > MAX_PAIR) {
+    //     do_insert_now(nullptr);
+    //     return true;
+    //   }
+    //   return false;
+    // } else
+
+    {
       p.set_op(INSERT);
       INSERT_RESULT_POINTER[WRITE_BUFFER_COUNTER++] = r;
       auto sz = p.size();
@@ -1065,6 +1344,7 @@ class Halo {
       return true;
     }
   }
+
   bool Update(Pair_t<KEY, VALUE> &p, int *r) {
     if (Unlikely(mmanager.ID == -1))
       memory_manager_Pool.get_PM_MemoryManager(&mmanager);
@@ -1080,12 +1360,15 @@ class Halo {
   }
   bool Get(Pair_t<KEY, VALUE> *p) {
     if (Unlikely(READ_BUFFER_SIZE == 1)) {
+      // todo: PRO
       auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
       auto addr = get_PM_addr(hkey);
+      // printf("hkey: %ld  ",hkey);
       if (addr) {
         p->load(addr);
       }
       READ_LOCK();
+      // printf("key: %ld  \n",p->key());
       return true;
     }
     BUFFER_READ[BUFFER_READ_COUNTER++] = p;
@@ -1097,20 +1380,91 @@ class Halo {
     READ_LOCK();
     return false;
   }
-  void get_all() { Gets(); }
-  bool Delete(Pair_t<KEY, VALUE> &p) {
-    auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
-    auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
-    auto offset = clhts[n]->clht_get(hkey).first;
-    if (offset == INVALID) return false;
-    if (Unlikely(mmanager.ID == -1))
-      memory_manager_Pool.get_PM_MemoryManager(&mmanager);
-    auto sz = clhts[n]->clht_remove(hkey, &p);
-    if (!sz.first) return false;
-    reclaim_ppage(sz.second, sz.first);
-    READ_LOCK();
-    return true;
+
+
+  size_t get_partition(int pass_number) {
+    return clhts[pass_number % TABLE_NUM]->get_chain_lenght(pass_number);
   }
+
+  void Get(int pass_number, size_t curr_chain, Pair_t<KEY, VALUE> *p) {
+	  // Pair_t<size_t, size_t> *p = new Pair_t<size_t, size_t>[1];  // cost 0.09s; 
+    if (Unlikely(READ_BUFFER_SIZE == 1)) {
+    auto addr = get_PM_addr(pass_number, curr_chain);
+    if (addr) {
+      p->load(addr);
+    }
+    READ_LOCK();
+    // // printf("--------------------------\n");
+    // return  *reinterpret_cast<size_t*> (p->key());
+    // return p->key();
+    return ;
+    }
+    BUFFER_READ_PASS_NUM[BUFFER_READ_COUNTER] = pass_number;
+    BUFFER_READ_CURR_CHAIN[BUFFER_READ_COUNTER] = curr_chain;  
+    BUFFER_READ[BUFFER_READ_COUNTER++] = p; 
+    if (BUFFER_READ_COUNTER == READ_BUFFER_SIZE) {
+      Gets_pro();
+      READ_LOCK();
+          // BUFFER_READ_COUNTER = 0;
+    }
+    READ_LOCK();
+  }
+
+
+  void Gets_pro() {
+    // prefetch
+
+    char *addrs[READ_BUFFER_SIZE];
+    for (size_t i = 0; i < BUFFER_READ_COUNTER; i++) {
+      auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(BUFFER_READ[i]);
+      addrs[i] = get_PM_addr(BUFFER_READ_PASS_NUM[i], BUFFER_READ_CURR_CHAIN[i]);
+      if (addrs[i]){
+      _mm_prefetch(reinterpret_cast<char *>(addrs[i]), _MM_HINT_NTA);
+      }
+
+    }
+    // load
+    for (size_t i = 0; i < BUFFER_READ_COUNTER; i++) {
+      // addrs[i] = get_PM_addr(BUFFER_READ_PASS_NUM[i], BUFFER_READ_CURR_CHAIN[i]);
+      if (!addrs[i]) {
+        continue;
+      }
+      auto r = reinterpret_cast<Pair_t<KEY, VALUE> *>(BUFFER_READ[i]);
+      r->load(addrs[i]);
+    }
+    BUFFER_READ_COUNTER = 0;
+  }
+
+
+  size_t Get_key(size_t table_number, size_t *table_index,
+                 size_t *bucket_number, size_t *buckets_index,
+                 Pair_t<KEY, VALUE> *p) {
+    size_t hkey = false;
+    while (hkey == false) {
+      hkey = clhts[table_number]->clht_get_key(table_index, bucket_number,
+                                               buckets_index);
+    }
+
+    //    printf("Get_key---hkey: %ld\n",hkey);
+    auto addr = get_PM_addr(hkey);
+    if (addr) {
+      p->load(addr);
+    }
+    READ_LOCK();
+    printf("--------------------------\n");
+    return p->key();
+    // return hkey;
+  }
+
+  size_t Get_table_size(size_t table_number) {
+    auto size_table =
+        clhts[table_number]->clht_size(clhts[table_number]->table);
+    // printf("table size(Get_table_size):%ld\n",size_table);
+    return size_table;
+  }
+
+  void get_all() { Gets(); }
+
   void load_factor() {
     // size_t total_slot = 0;
     // size_t used_slot = 0;
@@ -1140,6 +1494,7 @@ class Halo {
     // memory_manager_Pool.info();
   }
   void wait_all() { do_insert_now(); }
+
   void reclaim_ppage(size_t page_id, size_t sz_freed) {
     if (!LOGCLEAN) return;
 
@@ -1207,7 +1562,13 @@ class Halo {
     for (size_t i = 0; i < READ_BUFFER_SIZE; i++) {
       auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(BUFFER_READ[i]);
       auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
-      addrs[i] = get_PM_addr(hkey);
+      if (is_pro) {
+        size_t the_key = *reinterpret_cast<size_t *>(p->key());
+        addrs[i] = get_PM_addr(hkey, the_key);
+      } else {
+        addrs[i] = get_PM_addr(hkey);
+      }
+
       if (addrs[i])
         _mm_prefetch(reinterpret_cast<char *>(addrs[i]), _MM_HINT_NTA);
       else
@@ -1220,8 +1581,8 @@ class Halo {
       }
       auto r = reinterpret_cast<Pair_t<KEY, VALUE> *>(BUFFER_READ[i]);
       auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(addrs[i]);
-      // cout << r->str_key() << "!" << p->str_key() << " " << p->value() <<
-      // endl;
+      // cout << r->str_key() << "   !    " << p->str_key() << " " << p->value()
+      // << endl;
       if (r->str_key() != p->str_key()) cout << "ERROR!" << endl;
       r->load(addrs[i]);
       if (r->get_op() == OP_t::DELETED) r->set_empty();
@@ -1230,13 +1591,28 @@ class Halo {
   }
 
   char *get_PM_addr(size_t hkey) {
-    auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+	// printf("get_PM_addr hkey :%ld    \n",hkey);
+    auto n = GET_CLHT_INDEX_HKEY(hkey, TABLE_NUM);
     auto offset = clhts[n]->clht_get(hkey).first;
+
     if (offset == INVALID) return nullptr;
     auto page_index = offset / PAGE_SIZE;
     return reinterpret_cast<char *>(PPage_table[page_index].load() +
                                     offset % PAGE_SIZE);
   }
+
+  char *get_PM_addr(int num_pass, size_t chain_curr) {
+	// printf("get_PM_addr num_pass :%ld    ",num_pass);
+    auto n = GET_CLHT_INDEX(num_pass, TABLE_NUM);
+    auto offset = clhts[n]->clht_get(num_pass, chain_curr).first;
+    // printf("table number:%d    ",n);
+
+    if (offset == INVALID) return nullptr;
+    auto page_index = offset / PAGE_SIZE;
+    return reinterpret_cast<char *>(PPage_table[page_index].load() +
+                                    offset % PAGE_SIZE);
+  }
+
   void do_insert_now(void *ptr = nullptr) {
     if (!WRITE_BUFFER_COUNTER) return;
     auto len = WRITE_BUFFER_SIZE;
@@ -1260,20 +1636,35 @@ class Halo {
       auto paddr = reinterpret_cast<long long *>(o_and_a.second);
       pmem_memcpy_persist(paddr, add, bigpair->size());
     }
-    pmem_drain();
+    // pmem_drain();
     pm.update_metadata();
-    pmem_drain();
+    // pmem_drain();
     offset = offset_and_addr.first;
     bool resizing_flag_local = false;
     auto pair_addr = WRITE_BUFFER;
     // remove the count of big pair. The big pair is handled later.
     if (ptr) WRITE_BUFFER_COUNTER--;
     // insert key and offset into hash table
+	  // printf("WRITE_BUFFER_COUNTER:%d\n",WRITE_BUFFER_COUNTER);
     for (size_t i = 0; i < WRITE_BUFFER_COUNTER; i++) {
       auto p = Pair_t<KEY, VALUE>(pair_addr);
+
       auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
-      auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
-      clhts[n]->clht_put(hkey, offset);
+
+
+
+      // printf("hkey:%ld n:%d\n", hkey,n);
+      // printf("n:%d  clhts[n]->table->is_PRO:%d       is_pro:%d\n",n,clhts[n]->table->is_PRO,is_pro);
+      if (is_pro) {
+      size_t the_key = *reinterpret_cast<size_t *>(p.key());
+      auto n = GET_CLHT_INDEX(the_key, TABLE_NUM);
+        // printf("the_key:%ld n:%d\n", the_key,n);
+        clhts[n]->clht_put(hkey, the_key, offset);
+      } else {
+      auto n = GET_CLHT_INDEX_HKEY(hkey, TABLE_NUM);
+        clhts[n]->clht_put(hkey, offset);
+      }
+
       offset += p.size();
       pair_addr += p.size();
     }
@@ -1281,8 +1672,16 @@ class Halo {
     if (ptr) {
       auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(ptr);
       auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
-      auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
-      clhts[n]->clht_put(hkey, bigoffset);
+      //   auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+      //   clhts[n]->clht_put(hkey, bigoffset);
+      size_t the_key = *reinterpret_cast<size_t *>(p->key());
+      auto n = GET_CLHT_INDEX(the_key, TABLE_NUM);
+      // auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+      if (clhts[n]->table->is_PRO) {
+        clhts[n]->clht_put(hkey, the_key, offset);
+      } else {
+        clhts[n]->clht_put(hkey, offset);
+      }
     }
     if (ptr) WRITE_BUFFER_COUNTER++;
     // write back the result.
@@ -1309,5 +1708,6 @@ class Halo {
   mutex reclaim_mtx;
   std::set<size_t> ppages_reclaiming;
   std::unordered_set<size_t> ppages_to_reclaiming;
+  bool is_pro;
 };
-}  // namespace HALO
+// }  // namespace HALO
